@@ -532,6 +532,60 @@ function getFloorCells(grid) {
   return cells;
 }
 
+function getReachableCellsByFloor(floors, start) {
+  if (!floors.length) return [];
+  const height = floors[0].grid.length;
+  const width = floors[0].grid[0].length;
+  const reachable = floors.map(() =>
+    Array.from({ length: height }, () => Array(width).fill(false)),
+  );
+  if (floors[0].grid[start.y][start.x] !== 0) return reachable;
+
+  const queue = [{ f: 0, x: start.x, y: start.y }];
+  reachable[0][start.y][start.x] = true;
+
+  for (let i = 0; i < queue.length; i++) {
+    const { f, x, y } = queue[i];
+    const grid = floors[f].grid;
+    const dirs = [
+      { x: 1, y: 0 },
+      { x: -1, y: 0 },
+      { x: 0, y: 1 },
+      { x: 0, y: -1 },
+    ];
+    for (const dir of dirs) {
+      const nx = x + dir.x;
+      const ny = y + dir.y;
+      if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+      if (grid[ny][nx] === 1 || reachable[f][ny][nx]) continue;
+      reachable[f][ny][nx] = true;
+      queue.push({ f, x: nx, y: ny });
+    }
+
+    const floor = floors[f];
+    if (floor.rampUp && floor.rampUp.x === x && floor.rampUp.y === y) {
+      const next = f + 1;
+      if (next < floors.length && !reachable[next][y][x]) {
+        if (floors[next].grid[y][x] === 0) {
+          reachable[next][y][x] = true;
+          queue.push({ f: next, x, y });
+        }
+      }
+    }
+    if (floor.rampDown && floor.rampDown.x === x && floor.rampDown.y === y) {
+      const next = f - 1;
+      if (next >= 0 && !reachable[next][y][x]) {
+        if (floors[next].grid[y][x] === 0) {
+          reachable[next][y][x] = true;
+          queue.push({ f: next, x, y });
+        }
+      }
+    }
+  }
+
+  return reachable;
+}
+
 function findFarthestCell(grid, start) {
   const h = grid.length;
   const w = grid[0].length;
@@ -702,6 +756,20 @@ function generateLevel({ resetStats }) {
       wanderDirY: 0,
       wanderTimer: 0,
     }));
+  });
+
+  const reachableByFloor = getReachableCellsByFloor(floors, start);
+  floors.forEach((floor, floorIndex) => {
+    const reachable = reachableByFloor[floorIndex];
+    if (!reachable) return;
+    for (const enemy of floor.enemies) {
+      const ex = Math.floor(enemy.x);
+      const ey = Math.floor(enemy.y);
+      if (!reachable[ey]?.[ex]) {
+        enemy.alive = false;
+        enemy.health = 0;
+      }
+    }
   });
 
   setCurrentFloor(0);
@@ -1659,13 +1727,15 @@ function drawMiniMap() {
   }
 
   if (door && door.floor === currentFloor) {
+    const doorX = offsetX + Math.floor(door.x) * cellSize;
+    const doorY = offsetY + Math.floor(door.y) * cellSize;
     minimapCtx.fillStyle = door.open ? "#6fdc8c" : "#c7a26b";
-    minimapCtx.fillRect(
-      offsetX + Math.floor(door.x) * cellSize,
-      offsetY + Math.floor(door.y) * cellSize,
-      cellSize,
-      cellSize,
-    );
+    minimapCtx.fillRect(doorX, doorY, cellSize, cellSize);
+    minimapCtx.fillStyle = "#0b1119";
+    minimapCtx.font = `${Math.max(8, Math.floor(cellSize * 0.7))}px "Space Grotesk", sans-serif`;
+    minimapCtx.textAlign = "center";
+    minimapCtx.textBaseline = "middle";
+    minimapCtx.fillText("E", doorX + cellSize / 2, doorY + cellSize / 2);
   }
 
   const floor = floors[currentFloor];
