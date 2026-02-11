@@ -67,12 +67,33 @@ canvas {
   color: #9fb0ba;
 }
 
-#minimap {
+.slider {
+  display: grid;
+  gap: 6px;
+  font-size: 12px;
+  color: #9fb0ba;
+}
+
+.slider input[type="range"] {
   width: 180px;
-  height: 180px;
+  accent-color: var(--ember);
+}
+
+#minimap {
+  width: 360px;
+  height: 360px;
   border-radius: 10px;
   border: 1px solid rgba(255, 255, 255, 0.08);
   background: rgba(8, 12, 18, 0.85);
+}
+
+#minimap.fullscreen {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  border-radius: 0;
+  z-index: 30;
 }
 
 .notice {
@@ -80,12 +101,27 @@ canvas {
   inset: 0;
   display: grid;
   place-items: center;
-  font-size: clamp(24px, 4vw, 48px);
-  letter-spacing: 0.2em;
+  gap: 10px;
   text-transform: uppercase;
   color: #f5e6d3;
   background: rgba(4, 6, 10, 0.7);
   z-index: 20;
+  text-align: center;
+}
+
+.notice-title {
+  font-size: clamp(24px, 4vw, 48px);
+  letter-spacing: 0.2em;
+}
+
+.notice-score {
+  font-size: clamp(14px, 2vw, 22px);
+  letter-spacing: 0.12em;
+}
+
+.notice-hint {
+  font-size: clamp(12px, 1.6vw, 18px);
+  letter-spacing: 0.2em;
 }
 
 .notice[hidden] {

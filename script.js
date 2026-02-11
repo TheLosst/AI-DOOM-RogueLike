@@ -3,10 +3,22 @@ const ctx = canvas.getContext("2d", { alpha: false });
 const fpsEl = document.getElementById("fps");
 const hpEl = document.getElementById("hp");
 const killsEl = document.getElementById("kills");
+const levelEl = document.getElementById("level");
+const floorEl = document.getElementById("floor");
+const scoreEl = document.getElementById("score");
 const noticeEl = document.getElementById("notice");
+const finalScoreEl = document.getElementById("finalScore");
+const highScoreEl = document.getElementById("highScore");
 const minimap = document.getElementById("minimap");
 const minimapCtx = minimap ? minimap.getContext("2d") : null;
+const scaleSlider = document.getElementById("scaleSlider");
+const scaleValue = document.getElementById("scaleValue");
 noticeEl.hidden = true;
+
+const minimapState = {
+  fullscreen: false,
+  baseSize: 360,
+};
 
 const state = {
   posX: 3.5,
@@ -24,6 +36,14 @@ const state = {
   weaponFrameDuration: 0.15,
   shotTimer: 0,
   shotDuration: 0.09,
+  level: 1,
+  score: 10,
+  scoreTimer: 0,
+  rampProgress: 0,
+  rampFrom: 0,
+  rampTo: 0,
+  cameraHeight: 0,
+  rampCooldown: 0,
   firePressed: false,
   alive: true,
   keys: new Set(),
@@ -32,10 +52,45 @@ const state = {
   fpsFrames: 0,
 };
 
+const renderSettings = {
+  scale: 0.6,
+  width: 0,
+  height: 0,
+  imageData: null,
+  data: null,
+  zBuffer: null,
+};
+
+const savedScale = Number.parseFloat(localStorage.getItem("renderScale"));
+if (Number.isFinite(savedScale)) {
+  renderSettings.scale = clamp(savedScale, 0.4, 1);
+  if (scaleSlider) scaleSlider.value = renderSettings.scale.toFixed(2);
+  if (scaleValue) scaleValue.textContent = renderSettings.scale.toFixed(2);
+}
+
+if (scaleSlider) {
+  scaleSlider.addEventListener("input", (event) => {
+    const nextScale = Number.parseFloat(event.target.value);
+    if (Number.isFinite(nextScale)) {
+      renderSettings.scale = nextScale;
+      if (scaleValue) scaleValue.textContent = nextScale.toFixed(2);
+      localStorage.setItem("renderScale", nextScale.toFixed(2));
+      resize();
+    }
+  });
+}
+
+const savedHighScore = Number.parseInt(localStorage.getItem("highScore"), 10);
+if (Number.isFinite(savedHighScore) && highScoreEl) {
+  highScoreEl.textContent = String(savedHighScore);
+}
+
 let mapGrid = [];
 let WORLD_W = 0;
 let WORLD_H = 0;
 let door = null;
+let floors = [];
+let currentFloor = 0;
 
 const asphalt = new Image();
 const wallTex = new Image();
@@ -102,14 +157,39 @@ const levelConfig = {
 };
 
 function resize() {
-  const dpr = window.devicePixelRatio || 1;
-  canvas.width = Math.floor(window.innerWidth * dpr);
-  canvas.height = Math.floor(window.innerHeight * dpr);
+  const width = Math.max(
+    320,
+    Math.floor(window.innerWidth * renderSettings.scale),
+  );
+  const height = Math.max(
+    240,
+    Math.floor(window.innerHeight * renderSettings.scale),
+  );
+  canvas.width = width;
+  canvas.height = height;
+  renderSettings.width = width;
+  renderSettings.height = height;
+  renderSettings.imageData = ctx.createImageData(width, height);
+  renderSettings.data = renderSettings.imageData.data;
+  renderSettings.zBuffer = new Float32Array(width);
   ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+  resizeMinimap();
 }
 
 window.addEventListener("resize", resize);
 resize();
+
+function resizeMinimap() {
+  if (!minimap) return;
+  if (minimapState.fullscreen) {
+    minimap.width = window.innerWidth;
+    minimap.height = window.innerHeight;
+  } else {
+    minimap.width = minimapState.baseSize;
+    minimap.height = minimapState.baseSize;
+  }
+}
 
 function imageToData(img) {
   const tCanvas = document.createElement("canvas");
@@ -222,6 +302,93 @@ function shuffle(array) {
 
 function ensureOdd(value) {
   return value % 2 === 0 ? value + 1 : value;
+}
+
+function getHitsToKill(level) {
+  return 2 + Math.floor(level / 2);
+}
+
+function getEnemyMaxHealth(level) {
+  return getHitsToKill(level) * 20;
+}
+
+function awardScore(base) {
+  const multiplier = Math.max(1, state.level);
+  state.score += base * multiplier;
+}
+
+function getDeadEnds(grid) {
+  const deadEnds = [];
+  for (let y = 1; y < grid.length - 1; y++) {
+    for (let x = 1; x < grid[y].length - 1; x++) {
+      if (grid[y][x] !== 0) continue;
+      let walls = 0;
+      if (grid[y - 1][x] === 1) walls += 1;
+      if (grid[y + 1][x] === 1) walls += 1;
+      if (grid[y][x - 1] === 1) walls += 1;
+      if (grid[y][x + 1] === 1) walls += 1;
+      if (walls >= 3) deadEnds.push({ x, y });
+    }
+  }
+  return deadEnds;
+}
+
+function setCurrentFloor(index) {
+  currentFloor = clamp(index, 0, floors.length - 1);
+  setMap(floors[currentFloor].grid);
+  enemies = floors[currentFloor].enemies;
+  state.rampFrom = currentFloor;
+  state.rampTo = currentFloor;
+  state.rampProgress = 0;
+}
+
+function getRampAt(x, y) {
+  const floor = floors[currentFloor];
+  if (!floor) return null;
+  if (floor.rampUp && floor.rampUp.x === x && floor.rampUp.y === y) {
+    return { type: "up" };
+  }
+  if (floor.rampDown && floor.rampDown.x === x && floor.rampDown.y === y) {
+    return { type: "down" };
+  }
+  return null;
+}
+
+function isRampCell(mx, my) {
+  const floor = floors[currentFloor];
+  if (!floor) return false;
+  const up = floor.rampUp;
+  const down = floor.rampDown;
+  return (
+    (up && up.x === mx && up.y === my) ||
+    (down && down.x === mx && down.y === my)
+  );
+}
+
+function updateRamp(dt) {
+  const mx = Math.floor(state.posX);
+  const my = Math.floor(state.posY);
+  const ramp = getRampAt(mx, my);
+  const wantsUp = state.keys.has("KeyW") || state.keys.has("ArrowUp");
+  const wantsDown = state.keys.has("KeyS") || state.keys.has("ArrowDown");
+
+  if (ramp && (wantsUp || wantsDown) && state.rampCooldown <= 0) {
+    if (ramp.type === "up" && wantsUp && currentFloor < floors.length - 1) {
+      setCurrentFloor(currentFloor + 1);
+      state.rampCooldown = 2;
+    }
+    if (ramp.type === "down" && wantsDown && currentFloor > 0) {
+      setCurrentFloor(currentFloor - 1);
+      state.rampCooldown = 2;
+    }
+  }
+  state.rampProgress = 0;
+  state.rampFrom = currentFloor;
+  state.rampTo = currentFloor;
+}
+
+function updateCameraHeight() {
+  state.cameraHeight = 0;
 }
 
 function generateMaze(width, height) {
@@ -398,13 +565,55 @@ function findFarthestCell(grid, start) {
 }
 
 function generateLevel({ resetStats }) {
-  const size = ensureOdd(randInt(levelConfig.minSize, levelConfig.maxSize));
-  const { grid, rooms } = generateMaze(size, size);
-  setMap(grid);
+  if (resetStats) {
+    state.level = 1;
+    state.score = 10;
+    state.scoreTimer = 0;
+  }
+
+  const levelGrowth = Math.floor(state.level / 2);
+  const baseW = randInt(levelConfig.minSize, levelConfig.maxSize);
+  const baseH = randInt(levelConfig.minSize, levelConfig.maxSize);
+  const width = ensureOdd(baseW + levelGrowth * 4);
+  const height = ensureOdd(baseH + levelGrowth * 2);
+  const roll = Math.random();
+  const floorCount = roll < 0.5 ? 2 + Math.floor(state.level / 2) : 1;
+
+  floors = [];
+  for (let i = 0; i < floorCount; i++) {
+    const { grid, rooms } = generateMaze(width, height);
+    floors.push({ grid, rooms, enemies: [], rampUp: null, rampDown: null });
+  }
 
   const start = { x: 1, y: 1 };
-  const doorCell = findFarthestCell(grid, start);
-  door = { x: doorCell.x + 0.5, y: doorCell.y + 0.5, open: false };
+  for (let i = 0; i < floors.length - 1; i++) {
+    const deadEnds = getDeadEnds(floors[i].grid);
+    shuffle(deadEnds);
+    const fallback = getFloorCells(floors[i].grid);
+    const isStartCell = (cell) => cell.x === start.x && cell.y === start.y;
+    const rampDeadEnds =
+      i === 0 ? deadEnds.filter((cell) => !isStartCell(cell)) : deadEnds;
+    const rampFallback =
+      i === 0 ? fallback.filter((cell) => !isStartCell(cell)) : fallback;
+    const pick = rampDeadEnds[0] ||
+      rampFallback[0] ||
+      fallback[0] || { x: 1, y: 1 };
+    floors[i].rampUp = { x: pick.x, y: pick.y };
+    floors[i + 1].rampDown = { x: pick.x, y: pick.y };
+    floors[i].grid[pick.y][pick.x] = 0;
+    floors[i + 1].grid[pick.y][pick.x] = 0;
+  }
+
+  const topFloorIndex = floors.length - 1;
+  const topFloorGrid = floors[topFloorIndex].grid;
+  const doorSeed = floors[topFloorIndex].rampDown || start;
+  const doorCell = findFarthestCell(topFloorGrid, doorSeed);
+  door = {
+    x: doorCell.x + 0.5,
+    y: doorCell.y + 0.5,
+    open: false,
+    floor: topFloorIndex,
+  };
 
   state.posX = start.x + 0.5;
   state.posY = start.y + 0.5;
@@ -417,73 +626,85 @@ function generateLevel({ resetStats }) {
   outEffects = [];
   enemyProjectiles = [];
 
-  const safeRadius = 5;
-  const safeCells = new Set();
-  for (let y = start.y - safeRadius; y <= start.y + safeRadius; y++) {
-    for (let x = start.x - safeRadius; x <= start.x + safeRadius; x++) {
-      if (x < 0 || y < 0 || x >= WORLD_W || y >= WORLD_H) continue;
-      const dist = Math.hypot(x - start.x, y - start.y);
-      if (dist <= safeRadius) safeCells.add(`${x},${y}`);
-    }
-  }
-
   const baseEnemiesCount = Math.max(
     1,
     Math.floor(randInt(levelConfig.minEnemies, levelConfig.maxEnemies) / 2),
   );
-  const roomEnemySpawns = [];
-  for (const room of rooms) {
-    const area = room.w * room.h;
-    const roomCount = Math.max(
-      1,
-      Math.floor((area <= 4 ? 1 : area <= 6 ? 2 : area <= 9 ? 3 : 4) / 2),
-    );
-    const roomCells = [];
-    for (let y = room.y; y < room.y + room.h; y++) {
-      for (let x = room.x; x < room.x + room.w; x++) {
-        if (!safeCells.has(`${x},${y}`)) roomCells.push({ x, y });
+  const enemyHealth = getEnemyMaxHealth(state.level);
+
+  floors.forEach((floor, index) => {
+    const safeRadius = 5;
+    const safeCells = new Set();
+    const centers = [];
+    if (index === 0) centers.push(start);
+    if (floor.rampUp) centers.push(floor.rampUp);
+    if (floor.rampDown) centers.push(floor.rampDown);
+    for (const center of centers) {
+      for (let y = center.y - safeRadius; y <= center.y + safeRadius; y++) {
+        for (let x = center.x - safeRadius; x <= center.x + safeRadius; x++) {
+          if (x < 0 || y < 0 || x >= width || y >= height) continue;
+          const dist = Math.hypot(x - center.x, y - center.y);
+          if (dist <= safeRadius) safeCells.add(`${x},${y}`);
+        }
       }
     }
-    shuffle(roomCells);
-    for (let i = 0; i < roomCount && i < roomCells.length; i++) {
-      roomEnemySpawns.push(roomCells[i]);
-    }
-  }
 
-  const candidates = getFloorCells(grid).filter((cell) => {
-    const dStart = Math.hypot(cell.x - start.x, cell.y - start.y);
-    const dDoor = Math.hypot(cell.x - doorCell.x, cell.y - doorCell.y);
-    if (safeCells.has(`${cell.x},${cell.y}`)) return false;
-    return dStart > 4 && dDoor > 3;
+    const roomEnemySpawns = [];
+    for (const room of floor.rooms) {
+      const area = room.w * room.h;
+      const roomCount = Math.max(
+        1,
+        Math.floor((area <= 4 ? 1 : area <= 6 ? 2 : area <= 9 ? 3 : 4) / 2),
+      );
+      const roomCells = [];
+      for (let y = room.y; y < room.y + room.h; y++) {
+        for (let x = room.x; x < room.x + room.w; x++) {
+          if (!safeCells.has(`${x},${y}`)) roomCells.push({ x, y });
+        }
+      }
+      shuffle(roomCells);
+      for (let i = 0; i < roomCount && i < roomCells.length; i++) {
+        roomEnemySpawns.push(roomCells[i]);
+      }
+    }
+
+    const candidates = getFloorCells(floor.grid).filter((cell) => {
+      const dStart = Math.hypot(cell.x - start.x, cell.y - start.y);
+      const dDoor = Math.hypot(cell.x - doorCell.x, cell.y - doorCell.y);
+      if (safeCells.has(`${cell.x},${cell.y}`)) return false;
+      return dStart > 4 && dDoor > 3;
+    });
+    const reserved = new Set(
+      roomEnemySpawns.map((cell) => `${cell.x},${cell.y}`),
+    );
+    const corridorCandidates = candidates.filter(
+      (cell) => !reserved.has(`${cell.x},${cell.y}`),
+    );
+    shuffle(corridorCandidates);
+    const corridorSpawns = corridorCandidates.slice(0, baseEnemiesCount);
+    const spawns = roomEnemySpawns.concat(corridorSpawns);
+
+    floor.enemies = spawns.map((cell) => ({
+      x: cell.x + 0.5,
+      y: cell.y + 0.5,
+      speed: 0.8 + Math.random() * 0.6,
+      health: enemyHealth,
+      attackCooldown: 0,
+      alive: true,
+      state: "walk",
+      frameIndex: 0,
+      frameTimer: enemyAnim.walkFrameDuration,
+      fireCooldown: enemyAnim.fireCooldown * (0.6 + Math.random() * 0.6),
+      damagedTimer: 0,
+      didShoot: false,
+      countedKill: false,
+      wanderDirX: 0,
+      wanderDirY: 0,
+      wanderTimer: 0,
+    }));
   });
-  const reserved = new Set(
-    roomEnemySpawns.map((cell) => `${cell.x},${cell.y}`),
-  );
-  const corridorCandidates = candidates.filter(
-    (cell) => !reserved.has(`${cell.x},${cell.y}`),
-  );
-  shuffle(candidates);
-  shuffle(corridorCandidates);
-  const corridorSpawns = corridorCandidates.slice(0, baseEnemiesCount);
-  const spawns = roomEnemySpawns.concat(corridorSpawns);
-  enemies = spawns.map((cell) => ({
-    x: cell.x + 0.5,
-    y: cell.y + 0.5,
-    speed: 0.8 + Math.random() * 0.6,
-    health: 30,
-    attackCooldown: 0,
-    alive: true,
-    state: "walk",
-    frameIndex: 0,
-    frameTimer: enemyAnim.walkFrameDuration,
-    fireCooldown: enemyAnim.fireCooldown * (0.6 + Math.random() * 0.6),
-    damagedTimer: 0,
-    didShoot: false,
-    countedKill: false,
-    wanderDirX: 0,
-    wanderDirY: 0,
-    wanderTimer: 0,
-  }));
+
+  setCurrentFloor(0);
 }
 
 function spriteFrameFor(img) {
@@ -525,7 +746,7 @@ function isBlocked(x, y) {
   const mx = Math.floor(x);
   const my = Math.floor(y);
   if (isWallCell(mx, my)) return true;
-  if (door && !door.open) {
+  if (door && door.floor === currentFloor && !door.open) {
     if (mx === Math.floor(door.x) && my === Math.floor(door.y)) return true;
   }
   return false;
@@ -553,6 +774,7 @@ function resetGame() {
   state.weaponFrameTimer = 0;
   state.weaponPlaying = false;
   state.shotTimer = 0;
+  state.scoreTimer = 0;
   state.firePressed = false;
   state.keys.clear();
   state.alive = true;
@@ -593,6 +815,7 @@ function update(dt) {
   if (state.weaponCooldown > 0) state.weaponCooldown -= dt;
   if (state.weaponAnim > 0) state.weaponAnim -= dt;
   if (state.shotTimer > 0) state.shotTimer -= dt;
+  if (state.rampCooldown > 0) state.rampCooldown -= dt;
 
   if (state.weaponPlaying && weaponFrames) {
     state.weaponFrameTimer -= dt;
@@ -607,6 +830,13 @@ function update(dt) {
     }
   }
 
+  state.scoreTimer += dt;
+  if (state.scoreTimer >= 10) {
+    const penalty = Math.floor(state.scoreTimer / 10);
+    state.score = Math.max(0, state.score - penalty);
+    state.scoreTimer -= penalty * 10;
+  }
+
   if (state.firePressed && state.weaponCooldown <= 0 && !state.weaponPlaying) {
     fireWeapon();
   }
@@ -614,14 +844,21 @@ function update(dt) {
   updateEnemies(dt);
   updateOutEffects(dt);
   updateEnemyProjectiles(dt);
+  updateRamp(dt);
+  updateCameraHeight();
 
-  if (door && !door.open && enemies.every((enemy) => !enemy.alive)) {
-    door.open = true;
+  if (door && !door.open && floors.length > 0) {
+    const allDead = floors.every((floor) =>
+      floor.enemies.every((enemy) => !enemy.alive),
+    );
+    if (allDead) door.open = true;
   }
 
-  if (door && door.open) {
+  if (door && door.open && door.floor === currentFloor) {
     const dist = Math.hypot(state.posX - door.x, state.posY - door.y);
     if (dist < 0.6) {
+      awardScore(1000);
+      state.level += 1;
       generateLevel({ resetStats: false });
     }
   }
@@ -730,8 +967,7 @@ function updateEnemies(dt) {
         state.health = Math.max(0, state.health - 8);
         enemy.attackCooldown = 1.1;
         if (state.health <= 0) {
-          state.alive = false;
-          noticeEl.hidden = false;
+          handlePlayerDeath();
         }
       }
       continue;
@@ -785,6 +1021,7 @@ function applyEnemyDamage(enemy, damage) {
     enemy.didShoot = false;
     if (!enemy.countedKill) {
       state.kills += 1;
+      awardScore(100);
       enemy.countedKill = true;
     }
     return;
@@ -818,8 +1055,7 @@ function updateEnemyProjectiles(dt) {
     if (hitPlayer) {
       state.health = Math.max(0, state.health - 12);
       if (state.health <= 0) {
-        state.alive = false;
-        noticeEl.hidden = false;
+        handlePlayerDeath();
       }
       continue;
     }
@@ -874,12 +1110,17 @@ function getWeaponDrawRect(width, height) {
     frameH = weaponFrameH;
     srcX = frame.x;
   }
-  const scale = Math.min(3.6, (width / 900) * 3);
+  const screenW = window.innerWidth;
+  const screenH = window.innerHeight;
+  const renderScale = renderSettings.scale;
+  const scale = Math.min(3.6, (screenW / 900) * 3);
   const recoil = state.weaponAnim > 0 ? (state.weaponAnim / 0.12) * 10 : 0;
-  const drawW = frameW * scale;
-  const drawH = frameH * scale;
-  const drawX = Math.floor(width / 2 - drawW / 2);
-  const drawY = Math.floor(height - drawH + recoil);
+  const drawW = frameW * scale * renderScale;
+  const drawH = frameH * scale * renderScale;
+  const drawX = Math.floor((screenW * renderScale) / 2 - drawW / 2);
+  const drawY = Math.floor(
+    screenH * renderScale - drawH + recoil * renderScale + 1,
+  );
   return { frameW, frameH, srcX, scale, drawW, drawH, drawX, drawY };
 }
 
@@ -917,11 +1158,12 @@ function spawnOutEffects() {
 }
 
 function render() {
-  const width = canvas.width;
-  const height = canvas.height;
-  const imgData = ctx.createImageData(width, height);
-  const data = imgData.data;
-  const zBuffer = new Float32Array(width);
+  const width = renderSettings.width;
+  const height = renderSettings.height;
+  const imgData = renderSettings.imageData;
+  const data = renderSettings.data;
+  const zBuffer = renderSettings.zBuffer;
+  if (!imgData) return;
 
   const dirX = Math.cos(state.dir);
   const dirY = Math.sin(state.dir);
@@ -931,6 +1173,8 @@ function render() {
 
   const skyTop = [16, 22, 32];
   const skyBottom = [8, 12, 18];
+  const heightOffset = -state.cameraHeight * (height * 0.18);
+  const horizon = height / 2 + heightOffset;
 
   for (let x = 0; x < width; x++) {
     const cameraX = (2 * x) / width - 1;
@@ -993,15 +1237,11 @@ function render() {
     zBuffer[x] = wallDist;
     const lineHeight = Math.floor(height / wallDist);
     const drawStart = clamp(
-      Math.floor(-lineHeight / 2 + height / 2),
+      Math.floor(-lineHeight / 2 + horizon),
       0,
       height - 1,
     );
-    const drawEnd = clamp(
-      Math.floor(lineHeight / 2 + height / 2),
-      0,
-      height - 1,
-    );
+    const drawEnd = clamp(Math.floor(lineHeight / 2 + horizon), 0, height - 1);
 
     // Sky
     for (let y = 0; y < drawStart; y++) {
@@ -1047,7 +1287,7 @@ function render() {
       const texW = asphaltData.width;
       const texH = asphaltData.height;
       for (let y = drawEnd + 1; y < height; y++) {
-        const rowDistance = (height * 0.5) / (y - height / 2);
+        const rowDistance = (height - horizon) / (y - horizon);
         const floorX = state.posX + rowDistance * rayDirX;
         const floorY = state.posY + rowDistance * rayDirY;
         const tx = Math.floor((floorX - Math.floor(floorX)) * texW);
@@ -1055,9 +1295,19 @@ function render() {
         const texIdx = (ty * texW + tx) * 4;
         const idx = (y * width + x) * 4;
         const fog = clamp(1.2 - rowDistance * 0.15, 0.2, 1.0);
-        data[idx] = asphaltData.data[texIdx] * fog;
-        data[idx + 1] = asphaltData.data[texIdx + 1] * fog;
-        data[idx + 2] = asphaltData.data[texIdx + 2] * fog;
+        let r = asphaltData.data[texIdx] * fog;
+        let g = asphaltData.data[texIdx + 1] * fog;
+        let b = asphaltData.data[texIdx + 2] * fog;
+        const cellX = Math.floor(floorX);
+        const cellY = Math.floor(floorY);
+        if (isRampCell(cellX, cellY)) {
+          r = r * 0.6 + 80;
+          g = g * 0.6 + 110;
+          b = b * 0.6 + 160;
+        }
+        data[idx] = r;
+        data[idx + 1] = g;
+        data[idx + 2] = b;
         data[idx + 3] = 255;
       }
     }
@@ -1143,7 +1393,8 @@ function drawSprites(zBuffer, width, height, dirX, dirY, planeX, planeY) {
 }
 
 function drawDoor(zBuffer, width, height, dirX, dirY, planeX, planeY) {
-  if (!door || !doorSprite || !doorFrames) return;
+  if (!door || !doorSprite || !doorFrames || door.floor !== currentFloor)
+    return;
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   const invDet = 1.0 / (planeX * dirY - dirX * planeY);
   const spriteX = door.x - state.posX;
@@ -1276,8 +1527,9 @@ function drawShotEffect(width, height) {
   if (!shotSprite || state.shotTimer <= 0) return;
   const rect = getWeaponDrawRect(width, height);
   if (!rect) return;
-  const muzzleX = rect.drawX + rect.drawW * 0.78 - 179;
-  const muzzleY = rect.drawY + rect.drawH * 0.26 + 228;
+  const scale = renderSettings.scale;
+  const muzzleX = rect.drawX + rect.drawW * 0.78 - 179 * scale;
+  const muzzleY = rect.drawY + rect.drawH * 0.26 + 228 * scale;
   const shotW = rect.drawW * 0.35 * 3;
   const shotH = (shotSprite.height / shotSprite.width) * shotW;
   ctx.drawImage(
@@ -1343,6 +1595,9 @@ function frame(now) {
 
   hpEl.textContent = `HP: ${state.health}`;
   killsEl.textContent = `Kills: ${state.kills}`;
+  if (levelEl) levelEl.textContent = `Level: ${state.level}`;
+  if (floorEl) floorEl.textContent = `Floor: ${currentFloor + 1}`;
+  if (scoreEl) scoreEl.textContent = `Score: ${state.score}`;
 
   state.fpsFrames += 1;
   if (now - state.fpsTime > 500) {
@@ -1355,16 +1610,37 @@ function frame(now) {
   requestAnimationFrame(frame);
 }
 
+function handlePlayerDeath() {
+  state.health = 0;
+  state.alive = false;
+  const currentScore = Math.max(0, Math.floor(state.score));
+  if (finalScoreEl) finalScoreEl.textContent = String(currentScore);
+  const prevHigh = Number.parseInt(localStorage.getItem("highScore"), 10);
+  const best = Number.isFinite(prevHigh)
+    ? Math.max(prevHigh, currentScore)
+    : currentScore;
+  localStorage.setItem("highScore", String(best));
+  if (highScoreEl) highScoreEl.textContent = String(best);
+  noticeEl.hidden = false;
+}
+
 function drawMiniMap() {
   if (!minimapCtx || WORLD_W === 0 || WORLD_H === 0) return;
-  const size = minimap.width;
-  const cellSize = Math.floor(size / Math.max(WORLD_W, WORLD_H));
-  const offsetX = Math.floor((size - cellSize * WORLD_W) / 2);
-  const offsetY = Math.floor((size - cellSize * WORLD_H) / 2);
+  const canvasW = minimap.width;
+  const canvasH = minimap.height;
+  const size = Math.min(canvasW, canvasH);
+  const cellSize = Math.max(
+    1,
+    Math.floor((size - 16) / Math.max(WORLD_W, WORLD_H)),
+  );
+  const mapW = cellSize * WORLD_W;
+  const mapH = cellSize * WORLD_H;
+  const offsetX = Math.floor((canvasW - mapW) / 2);
+  const offsetY = Math.floor((canvasH - mapH) / 2);
 
-  minimapCtx.clearRect(0, 0, size, size);
+  minimapCtx.clearRect(0, 0, canvasW, canvasH);
   minimapCtx.fillStyle = "rgba(8, 12, 18, 0.85)";
-  minimapCtx.fillRect(0, 0, size, size);
+  minimapCtx.fillRect(0, 0, canvasW, canvasH);
 
   for (let y = 0; y < WORLD_H; y++) {
     for (let x = 0; x < WORLD_W; x++) {
@@ -1382,7 +1658,7 @@ function drawMiniMap() {
     }
   }
 
-  if (door) {
+  if (door && door.floor === currentFloor) {
     minimapCtx.fillStyle = door.open ? "#6fdc8c" : "#c7a26b";
     minimapCtx.fillRect(
       offsetX + Math.floor(door.x) * cellSize,
@@ -1390,6 +1666,45 @@ function drawMiniMap() {
       cellSize,
       cellSize,
     );
+  }
+
+  const floor = floors[currentFloor];
+  if (floor) {
+    minimapCtx.fillStyle = "#6bb7ff";
+    if (floor.rampUp) {
+      minimapCtx.fillRect(
+        offsetX + floor.rampUp.x * cellSize,
+        offsetY + floor.rampUp.y * cellSize,
+        cellSize,
+        cellSize,
+      );
+    }
+    if (floor.rampDown) {
+      minimapCtx.fillRect(
+        offsetX + floor.rampDown.x * cellSize,
+        offsetY + floor.rampDown.y * cellSize,
+        cellSize,
+        cellSize,
+      );
+    }
+    minimapCtx.fillStyle = "#e6f0ff";
+    minimapCtx.font = `${Math.max(8, Math.floor(cellSize * 0.7))}px "Space Grotesk", sans-serif`;
+    minimapCtx.textAlign = "center";
+    minimapCtx.textBaseline = "middle";
+    if (floor.rampUp) {
+      minimapCtx.fillText(
+        "U",
+        offsetX + floor.rampUp.x * cellSize + cellSize / 2,
+        offsetY + floor.rampUp.y * cellSize + cellSize / 2,
+      );
+    }
+    if (floor.rampDown) {
+      minimapCtx.fillText(
+        "D",
+        offsetX + floor.rampDown.x * cellSize + cellSize / 2,
+        offsetY + floor.rampDown.y * cellSize + cellSize / 2,
+      );
+    }
   }
 
   for (const enemy of enemies) {
@@ -1429,6 +1744,7 @@ window.addEventListener("keydown", (event) => {
   if (event.code === "KeyT") teleportToDoor();
   if (event.code === "KeyY") killAllEnemies();
   if (event.code === "KeyU") killPlayer();
+  if (event.code === "KeyQ") toggleMinimap();
 });
 
 window.addEventListener("keyup", (event) => {
@@ -1442,6 +1758,13 @@ window.addEventListener("mousedown", () => {
 window.addEventListener("mouseup", () => {
   state.firePressed = false;
 });
+
+function toggleMinimap() {
+  if (!minimap) return;
+  minimapState.fullscreen = !minimapState.fullscreen;
+  minimap.classList.toggle("fullscreen", minimapState.fullscreen);
+  resizeMinimap();
+}
 
 function teleportToDoor() {
   if (!door) return;
@@ -1469,24 +1792,25 @@ function teleportToDoor() {
 }
 
 function killAllEnemies() {
-  for (const enemy of enemies) {
-    if (!enemy.alive) continue;
-    enemy.health = 0;
-    enemy.state = "dying";
-    enemy.frameIndex = 0;
-    enemy.frameTimer = enemyAnim.dyingFrameDuration;
-    enemy.didShoot = false;
-    if (!enemy.countedKill) {
-      state.kills += 1;
-      enemy.countedKill = true;
+  for (const floor of floors) {
+    for (const enemy of floor.enemies) {
+      if (!enemy.alive) continue;
+      enemy.health = 0;
+      enemy.state = "dying";
+      enemy.frameIndex = 0;
+      enemy.frameTimer = enemyAnim.dyingFrameDuration;
+      enemy.didShoot = false;
+      if (!enemy.countedKill) {
+        state.kills += 1;
+        awardScore(100);
+        enemy.countedKill = true;
+      }
     }
   }
 }
 
 function killPlayer() {
-  state.health = 0;
-  state.alive = false;
-  noticeEl.hidden = false;
+  handlePlayerDeath();
 }
 
 Promise.all([
