@@ -13,11 +13,26 @@ const minimap = document.getElementById("minimap");
 const minimapCtx = minimap ? minimap.getContext("2d") : null;
 const scaleSlider = document.getElementById("scaleSlider");
 const scaleValue = document.getElementById("scaleValue");
+const menuEl = document.getElementById("menu");
+const menuHiScoreEl = document.getElementById("menuHiScore");
+const hudEl = document.querySelector(".hud");
+const healthBarEl = document.getElementById("healthBar");
 noticeEl.hidden = true;
+
+let gameState = "menu";
+
+const deathAnim = { active: false, progress: 0, time: 0, duration: 2.0 };
 
 const minimapState = {
   fullscreen: false,
-  baseSize: 360,
+  baseSize: 250,
+  dirty: true,
+  lastPosX: -1,
+  lastPosY: -1,
+  lastDir: -1,
+  lastFloor: -1,
+  lastKills: -1,
+  lastDoorOpen: null,
 };
 
 const state = {
@@ -139,6 +154,13 @@ let enemies = [];
 let outEffects = [];
 let enemyProjectiles = [];
 
+let enemyWalkData = null;
+let enemyFireData = null;
+let enemyDamagedData = null;
+let enemyDyingData = null;
+let doorData = null;
+const spriteOrderBuffer = [];
+
 const enemyAnim = {
   walkFrameDuration: 0.16,
   fireFrameDuration: 0.14,
@@ -174,6 +196,16 @@ function resize() {
   renderSettings.zBuffer = new Float32Array(width);
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.imageSmoothingEnabled = false;
+
+  const skyLut = new Uint8Array(height * 3);
+  for (let y = 0; y < height; y++) {
+    const t = y / (height * 0.55);
+    skyLut[y * 3]     = Math.floor(16 + (8  - 16) * t);
+    skyLut[y * 3 + 1] = Math.floor(22 + (12 - 22) * t);
+    skyLut[y * 3 + 2] = Math.floor(32 + (18 - 32) * t);
+  }
+  renderSettings.skyLut = skyLut;
+
   resizeMinimap();
 }
 
@@ -198,6 +230,10 @@ function imageToData(img) {
   const tCtx = tCanvas.getContext("2d");
   tCtx.drawImage(img, 0, 0);
   return tCtx.getImageData(0, 0, img.width, img.height);
+}
+
+function canvasToPixelData(canvasEl) {
+  return canvasEl.getContext("2d").getImageData(0, 0, canvasEl.width, canvasEl.height);
 }
 
 function loadImage(img, src) {
@@ -333,6 +369,17 @@ function getDeadEnds(grid) {
   return deadEnds;
 }
 
+let rampGrid = null;
+
+function buildRampGrid() {
+  if (!WORLD_W || !WORLD_H) { rampGrid = null; return; }
+  rampGrid = new Uint8Array(WORLD_W * WORLD_H);
+  const floor = floors[currentFloor];
+  if (!floor) return;
+  if (floor.rampUp)   rampGrid[floor.rampUp.y   * WORLD_W + floor.rampUp.x]   = 1;
+  if (floor.rampDown) rampGrid[floor.rampDown.y  * WORLD_W + floor.rampDown.x] = 1;
+}
+
 function setCurrentFloor(index) {
   currentFloor = clamp(index, 0, floors.length - 1);
   setMap(floors[currentFloor].grid);
@@ -340,6 +387,7 @@ function setCurrentFloor(index) {
   state.rampFrom = currentFloor;
   state.rampTo = currentFloor;
   state.rampProgress = 0;
+  buildRampGrid();
 }
 
 function getRampAt(x, y) {
@@ -847,7 +895,34 @@ function resetGame() {
   state.keys.clear();
   state.alive = true;
   noticeEl.hidden = true;
+  deathAnim.active = false;
+  deathAnim.progress = 0;
+  deathAnim.time = 0;
+  hudEl.style.opacity = "";
   generateLevel({ resetStats: true });
+}
+
+function showMenu() {
+  gameState = "menu";
+  menuEl.hidden = false;
+  hudEl.style.display = "none";
+  noticeEl.hidden = true;
+  deathAnim.active = false;
+  deathAnim.progress = 0;
+  deathAnim.time = 0;
+  state.keys.clear();
+  state.firePressed = false;
+  const hs = Number.parseInt(localStorage.getItem("highScore"), 10);
+  if (menuHiScoreEl) menuHiScoreEl.textContent = Number.isFinite(hs) ? String(hs) : "—";
+  generateLevel({ resetStats: true });
+}
+
+function startGame() {
+  gameState = "playing";
+  menuEl.hidden = true;
+  hudEl.style.display = "";
+  hudEl.style.opacity = "";
+  resetGame();
 }
 
 function update(dt) {
@@ -1239,8 +1314,7 @@ function render() {
   const planeX = -dirY * Math.tan(fov / 2);
   const planeY = dirX * Math.tan(fov / 2);
 
-  const skyTop = [16, 22, 32];
-  const skyBottom = [8, 12, 18];
+  const skyLut = renderSettings.skyLut;
   const heightOffset = -state.cameraHeight * (height * 0.18);
   const horizon = height / 2 + heightOffset;
 
@@ -1313,14 +1387,11 @@ function render() {
 
     // Sky
     for (let y = 0; y < drawStart; y++) {
-      const t = y / (height * 0.55);
-      const r = Math.floor(skyTop[0] + (skyBottom[0] - skyTop[0]) * t);
-      const g = Math.floor(skyTop[1] + (skyBottom[1] - skyTop[1]) * t);
-      const b = Math.floor(skyTop[2] + (skyBottom[2] - skyTop[2]) * t);
       const idx = (y * width + x) * 4;
-      data[idx] = r;
-      data[idx + 1] = g;
-      data[idx + 2] = b;
+      const li = y * 3;
+      data[idx]     = skyLut[li];
+      data[idx + 1] = skyLut[li + 1];
+      data[idx + 2] = skyLut[li + 2];
       data[idx + 3] = 255;
     }
 
@@ -1368,7 +1439,7 @@ function render() {
         let b = asphaltData.data[texIdx + 2] * fog;
         const cellX = Math.floor(floorX);
         const cellY = Math.floor(floorY);
-        if (isRampCell(cellX, cellY)) {
+        if (rampGrid && rampGrid[cellY * WORLD_W + cellX]) {
           r = r * 0.6 + 80;
           g = g * 0.6 + 110;
           b = b * 0.6 + 160;
@@ -1381,89 +1452,97 @@ function render() {
     }
   }
 
+  if (gameState !== "menu") {
+    drawDoor(data, zBuffer, width, height, dirX, dirY, planeX, planeY);
+    drawSprites(data, zBuffer, width, height, dirX, dirY, planeX, planeY);
+  }
   ctx.putImageData(imgData, 0, 0);
 
-  drawDoor(zBuffer, width, height, dirX, dirY, planeX, planeY);
-  drawSprites(zBuffer, width, height, dirX, dirY, planeX, planeY);
-  drawEnemyProjectiles(zBuffer, width, height, dirX, dirY, planeX, planeY);
-  drawShotEffect(width, height);
-  drawWeapon(width, height);
-  drawOutEffects(width, height);
-  drawCrosshair(width, height);
+  if (gameState !== "menu") {
+    drawEnemyProjectiles(zBuffer, width, height, dirX, dirY, planeX, planeY);
+    if (state.alive) {
+      drawShotEffect(width, height);
+      drawWeapon(width, height);
+      drawOutEffects(width, height);
+      drawCrosshair(width, height);
+    }
+  }
+  drawDeathOverlay();
 }
 
-function drawSprites(zBuffer, width, height, dirX, dirY, planeX, planeY) {
-  if (!enemyWalkSprite || !enemyWalkFrames) return;
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
+function drawSprites(data, zBuffer, width, height, dirX, dirY, planeX, planeY) {
+  if (!enemyWalkData || !enemyWalkFrames) return;
   const invDet = 1.0 / (planeX * dirY - dirX * planeY);
-  const ordered = enemies
-    .filter((enemy) => enemy.alive)
-    .map((enemy) => ({
-      enemy,
-      dx: enemy.x - state.posX,
-      dy: enemy.y - state.posY,
-      dist: (enemy.x - state.posX) ** 2 + (enemy.y - state.posY) ** 2,
-    }))
-    .sort((a, b) => b.dist - a.dist);
 
-  for (const item of ordered) {
-    const spriteX = item.dx;
-    const spriteY = item.dy;
-    const transformX = invDet * (dirY * spriteX - dirX * spriteY);
-    const transformY = invDet * (-planeY * spriteX + planeX * spriteY);
+  spriteOrderBuffer.length = 0;
+  for (const enemy of enemies) {
+    if (!enemy.alive) continue;
+    const dx = enemy.x - state.posX;
+    const dy = enemy.y - state.posY;
+    spriteOrderBuffer.push({ enemy, dx, dy, dist: dx * dx + dy * dy });
+  }
+  spriteOrderBuffer.sort((a, b) => b.dist - a.dist);
+
+  for (const item of spriteOrderBuffer) {
+    const transformX = invDet * (dirY * item.dx - dirX * item.dy);
+    const transformY = invDet * (-planeY * item.dx + planeX * item.dy);
     if (transformY <= 0.2) continue;
 
-    const spriteScreenX = Math.floor(
-      (width / 2) * (1 + transformX / transformY),
-    );
+    const spriteScreenX = Math.floor((width / 2) * (1 + transformX / transformY));
     const sheet = getEnemySheet(item.enemy);
-    if (!sheet) continue;
+    const pixelData = getEnemyPixelData(item.enemy);
+    if (!sheet || !pixelData) continue;
+
     const frame = sheet.frames[sheet.frameIndex] || sheet.frames[0];
     const frameW = frame.w;
     const frameH = sheet.frameH;
     const spriteH = Math.abs(height / transformY) * 0.8;
+    if (spriteH <= 0) continue;
     const spriteW = spriteH * (frameW / frameH);
-    const drawStartY = clamp(
-      Math.floor(-spriteH / 2 + height / 2),
-      0,
-      height - 1,
-    );
-    const drawEndY = clamp(Math.floor(spriteH / 2 + height / 2), 0, height - 1);
-    const drawStartX = clamp(
-      Math.floor(-spriteW / 2 + spriteScreenX),
-      0,
-      width - 1,
-    );
-    const drawEndX = clamp(
-      Math.floor(spriteW / 2 + spriteScreenX),
-      0,
-      width - 1,
-    );
+
+    const unclampedStartY = Math.floor(-spriteH / 2 + height / 2);
+    const drawStartY = clamp(unclampedStartY, 0, height - 1);
+    const drawEndY   = clamp(Math.floor(spriteH / 2 + height / 2), 0, height - 1);
+    const drawStartX = clamp(Math.floor(-spriteW / 2 + spriteScreenX), 0, width - 1);
+    const drawEndX   = clamp(Math.floor(spriteW / 2 + spriteScreenX), 0, width - 1);
+    if (drawEndY <= drawStartY || drawEndX <= drawStartX) continue;
+
+    const pData    = pixelData.data;
+    const srcWidth = pixelData.width;
+    const invSpriteH = frameH / spriteH;
+    const invSpriteW = frameW / spriteW;
+    const halfSpriteW = spriteW / 2;
 
     for (let stripe = drawStartX; stripe < drawEndX; stripe++) {
       if (transformY >= zBuffer[stripe]) continue;
-      const texX = Math.floor(
-        ((stripe - (-spriteW / 2 + spriteScreenX)) * frameW) / spriteW,
-      );
-      ctx.drawImage(
-        sheet.image,
-        frame.x + texX,
-        0,
-        1,
-        frameH,
-        stripe,
-        drawStartY,
-        1,
-        drawEndY - drawStartY,
-      );
+      const texX = clamp(Math.floor((stripe - (spriteScreenX - halfSpriteW)) * invSpriteW), 0, frameW - 1);
+      const srcX = frame.x + texX;
+
+      for (let y = drawStartY; y < drawEndY; y++) {
+        const srcY = Math.floor((y - unclampedStartY) * invSpriteH);
+        if (srcY < 0 || srcY >= frameH) continue;
+        const srcIdx = (srcY * srcWidth + srcX) * 4;
+        const alpha = pData[srcIdx + 3];
+        if (alpha === 0) continue;
+        const dstIdx = (y * width + stripe) * 4;
+        if (alpha >= 254) {
+          data[dstIdx]     = pData[srcIdx];
+          data[dstIdx + 1] = pData[srcIdx + 1];
+          data[dstIdx + 2] = pData[srcIdx + 2];
+        } else {
+          const a = alpha / 255;
+          const inv = 1 - a;
+          data[dstIdx]     = (pData[srcIdx]     * a + data[dstIdx]     * inv) | 0;
+          data[dstIdx + 1] = (pData[srcIdx + 1] * a + data[dstIdx + 1] * inv) | 0;
+          data[dstIdx + 2] = (pData[srcIdx + 2] * a + data[dstIdx + 2] * inv) | 0;
+        }
+      }
     }
   }
 }
 
-function drawDoor(zBuffer, width, height, dirX, dirY, planeX, planeY) {
-  if (!door || !doorSprite || !doorFrames || door.floor !== currentFloor)
-    return;
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
+function drawDoor(data, zBuffer, width, height, dirX, dirY, planeX, planeY) {
+  if (!door || !doorData || !doorFrames || door.floor !== currentFloor) return;
   const invDet = 1.0 / (planeX * dirY - dirX * planeY);
   const spriteX = door.x - state.posX;
   const spriteY = door.y - state.posY;
@@ -1473,40 +1552,50 @@ function drawDoor(zBuffer, width, height, dirX, dirY, planeX, planeY) {
 
   const spriteScreenX = Math.floor((width / 2) * (1 + transformX / transformY));
   const frameIndex = door.open ? 1 : 0;
-  const frame = doorFrames[frameIndex] || doorFrames[0];
+  const frame = doorFrames[Math.min(frameIndex, doorFrames.length - 1)];
   const frameW = frame.w;
   const frameH = doorFrameH;
   const spriteH = Math.abs(height / transformY);
+  if (spriteH <= 0) return;
   const spriteW = spriteH * (frameW / frameH);
-  const drawStartY = clamp(
-    Math.floor(-spriteH / 2 + height / 2),
-    0,
-    height - 1,
-  );
-  const drawEndY = clamp(Math.floor(spriteH / 2 + height / 2), 0, height - 1);
-  const drawStartX = clamp(
-    Math.floor(-spriteW / 2 + spriteScreenX),
-    0,
-    width - 1,
-  );
-  const drawEndX = clamp(Math.floor(spriteW / 2 + spriteScreenX), 0, width - 1);
+
+  const unclampedStartY = Math.floor(-spriteH / 2 + height / 2);
+  const drawStartY = clamp(unclampedStartY, 0, height - 1);
+  const drawEndY   = clamp(Math.floor(spriteH / 2 + height / 2), 0, height - 1);
+  const drawStartX = clamp(Math.floor(-spriteW / 2 + spriteScreenX), 0, width - 1);
+  const drawEndX   = clamp(Math.floor(spriteW / 2 + spriteScreenX), 0, width - 1);
+  if (drawEndY <= drawStartY || drawEndX <= drawStartX) return;
+
+  const pData      = doorData.data;
+  const srcWidth   = doorData.width;
+  const invSpriteH = frameH / spriteH;
+  const invSpriteW = frameW / spriteW;
+  const halfSpriteW = spriteW / 2;
 
   for (let stripe = drawStartX; stripe < drawEndX; stripe++) {
     if (transformY >= zBuffer[stripe]) continue;
-    const texX = Math.floor(
-      ((stripe - (-spriteW / 2 + spriteScreenX)) * frameW) / spriteW,
-    );
-    ctx.drawImage(
-      doorSprite,
-      frame.x + texX,
-      0,
-      1,
-      frameH,
-      stripe,
-      drawStartY,
-      1,
-      drawEndY - drawStartY,
-    );
+    const texX = clamp(Math.floor((stripe - (spriteScreenX - halfSpriteW)) * invSpriteW), 0, frameW - 1);
+    const srcX = frame.x + texX;
+
+    for (let y = drawStartY; y < drawEndY; y++) {
+      const srcY = Math.floor((y - unclampedStartY) * invSpriteH);
+      if (srcY < 0 || srcY >= frameH) continue;
+      const srcIdx = (srcY * srcWidth + srcX) * 4;
+      const alpha = pData[srcIdx + 3];
+      if (alpha === 0) continue;
+      const dstIdx = (y * width + stripe) * 4;
+      if (alpha >= 254) {
+        data[dstIdx]     = pData[srcIdx];
+        data[dstIdx + 1] = pData[srcIdx + 1];
+        data[dstIdx + 2] = pData[srcIdx + 2];
+      } else {
+        const a = alpha / 255;
+        const inv = 1 - a;
+        data[dstIdx]     = (pData[srcIdx]     * a + data[dstIdx]     * inv) | 0;
+        data[dstIdx + 1] = (pData[srcIdx + 1] * a + data[dstIdx + 1] * inv) | 0;
+        data[dstIdx + 2] = (pData[srcIdx + 2] * a + data[dstIdx + 2] * inv) | 0;
+      }
+    }
     zBuffer[stripe] = Math.min(zBuffer[stripe], transformY);
   }
 }
@@ -1542,6 +1631,13 @@ function getEnemySheet(enemy) {
     frameH: enemyWalkFrameH,
     frameIndex: enemy.frameIndex % enemyWalkFrames.length,
   };
+}
+
+function getEnemyPixelData(enemy) {
+  if (enemy.state === "dying" && enemyDyingData) return enemyDyingData;
+  if (enemy.state === "damaged" && enemyDamagedData) return enemyDamagedData;
+  if (enemy.state === "fire" && enemyFireData) return enemyFireData;
+  return enemyWalkData;
 }
 
 function drawEnemyProjectiles(
@@ -1637,6 +1733,54 @@ function drawOutEffects() {
   }
 }
 
+function drawDeathOverlay() {
+  if (!deathAnim.active || deathAnim.progress <= 0) return;
+  const w = canvas.width;
+  const h = canvas.height;
+  const p = deathAnim.progress;
+  const t = deathAnim.time;
+
+  const fillH = Math.min(p * 1.12, 1.0) * h;
+  if (fillH > 1) {
+    const grad = ctx.createLinearGradient(0, h, 0, h - fillH);
+    grad.addColorStop(0,    "rgba(8,   0,  0, 1.0)");
+    grad.addColorStop(0.42, "rgba(65,  0,  0, 0.96)");
+    grad.addColorStop(0.72, "rgba(110, 6,  6, 0.78)");
+    grad.addColorStop(0.88, "rgba(135, 14, 14, 0.32)");
+    grad.addColorStop(1,    "rgba(145, 18, 18, 0.0)");
+
+    const waveAmp = Math.max(1, 14 * (1 - p * 0.7));
+    const steps = 120;
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(0, h);
+    ctx.lineTo(w, h);
+    for (let i = steps; i >= 0; i--) {
+      const x = (i / steps) * w;
+      const wave =
+        Math.sin(x * 0.020 + t * 5.2) * waveAmp +
+        Math.sin(x * 0.048 + t * 3.3) * waveAmp * 0.42 +
+        Math.sin(x * 0.009 + t * 1.6) * waveAmp * 0.28;
+      ctx.lineTo(x, h - fillH + wave);
+    }
+    ctx.closePath();
+    ctx.fillStyle = grad;
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // Кровавая виньетка по краям
+  ctx.save();
+  const vig = ctx.createRadialGradient(w / 2, h / 2, 0, w / 2, h / 2, Math.hypot(w, h) * 0.52);
+  vig.addColorStop(0,    "rgba(0,0,0,0)");
+  vig.addColorStop(0.55, "rgba(40,0,0,0)");
+  vig.addColorStop(1,    `rgba(110,0,0,${Math.min(p * 0.85, 0.72)})`);
+  ctx.fillStyle = vig;
+  ctx.fillRect(0, 0, w, h);
+  ctx.restore();
+}
+
 function drawCrosshair(width, height) {
   ctx.strokeStyle = "rgba(240, 230, 214, 0.9)";
   ctx.lineWidth = 2;
@@ -1657,20 +1801,35 @@ function drawCrosshair(width, height) {
 function frame(now) {
   const dt = Math.min(0.05, (now - state.lastTime) / 1000);
   state.lastTime = now;
-  update(dt);
-  render();
-  drawMiniMap();
 
-  hpEl.textContent = `HP: ${state.health}`;
-  killsEl.textContent = `Kills: ${state.kills}`;
-  if (levelEl) levelEl.textContent = `Level: ${state.level}`;
-  if (floorEl) floorEl.textContent = `Floor: ${currentFloor + 1}`;
-  if (scoreEl) scoreEl.textContent = `Score: ${state.score}`;
+  if (gameState === "menu") {
+    state.dir += 0.28 * dt;
+    render();
+  } else {
+    update(dt);
+
+    if (deathAnim.active) {
+      deathAnim.time += dt;
+      deathAnim.progress = Math.min(1, deathAnim.time / deathAnim.duration);
+      if (deathAnim.progress >= 0.62 && noticeEl.hidden) {
+        noticeEl.hidden = false;
+      }
+    }
+
+    render();
+    drawMiniMap();
+    hpEl.textContent = String(Math.max(0, state.health));
+    if (healthBarEl) healthBarEl.style.width = Math.max(0, state.health) + "%";
+    killsEl.textContent = `${state.kills} KILLS`;
+    if (levelEl) levelEl.textContent = `LVL ${state.level}`;
+    if (floorEl) floorEl.textContent = `FLOOR ${currentFloor + 1}`;
+    if (scoreEl) scoreEl.textContent = String(Math.floor(state.score));
+  }
 
   state.fpsFrames += 1;
   if (now - state.fpsTime > 500) {
     const fps = Math.round((state.fpsFrames * 1000) / (now - state.fpsTime));
-    fpsEl.textContent = `FPS: ${fps}`;
+    fpsEl.textContent = `${fps} FPS`;
     state.fpsFrames = 0;
     state.fpsTime = now;
   }
@@ -1689,11 +1848,29 @@ function handlePlayerDeath() {
     : currentScore;
   localStorage.setItem("highScore", String(best));
   if (highScoreEl) highScoreEl.textContent = String(best);
-  noticeEl.hidden = false;
+  deathAnim.active = true;
+  deathAnim.progress = 0;
+  deathAnim.time = 0;
+  hudEl.style.opacity = "0";
 }
 
 function drawMiniMap() {
   if (!minimapCtx || WORLD_W === 0 || WORLD_H === 0) return;
+
+  const ms = minimapState;
+  const curDoorOpen = door ? door.open : null;
+  if (
+    !ms.dirty &&
+    Math.abs(state.posX - ms.lastPosX) < 0.05 &&
+    Math.abs(state.posY - ms.lastPosY) < 0.05 &&
+    Math.abs(state.dir - ms.lastDir) < 0.02 &&
+    currentFloor === ms.lastFloor &&
+    state.kills === ms.lastKills &&
+    curDoorOpen === ms.lastDoorOpen
+  ) return;
+  ms.lastPosX = state.posX; ms.lastPosY = state.posY; ms.lastDir = state.dir;
+  ms.lastFloor = currentFloor; ms.lastKills = state.kills; ms.lastDoorOpen = curDoorOpen;
+  ms.dirty = false;
   const canvasW = minimap.width;
   const canvasH = minimap.height;
   const size = Math.min(canvasW, canvasH);
@@ -1809,13 +1986,20 @@ window.addEventListener("keydown", (event) => state.keys.add(event.code));
 window.addEventListener("keyup", (event) => state.keys.delete(event.code));
 
 window.addEventListener("keydown", (event) => {
+  if (gameState === "menu") {
+    if (event.code === "Enter" || event.code === "Space") startGame();
+    return;
+  }
   if (event.code === "Space") state.firePressed = true;
   if (event.code === "KeyR" && !state.alive) resetGame();
+  if (event.code === "KeyM" && !state.alive) showMenu();
   if (event.code === "KeyT") teleportToDoor();
   if (event.code === "KeyY") killAllEnemies();
   if (event.code === "KeyU") killPlayer();
   if (event.code === "KeyQ") toggleMinimap();
 });
+
+document.getElementById("menuStart").addEventListener("click", startGame);
 
 window.addEventListener("keyup", (event) => {
   if (event.code === "Space") state.firePressed = false;
@@ -1832,6 +2016,7 @@ window.addEventListener("mouseup", () => {
 function toggleMinimap() {
   if (!minimap) return;
   minimapState.fullscreen = !minimapState.fullscreen;
+  minimapState.dirty = true;
   minimap.classList.toggle("fullscreen", minimapState.fullscreen);
   resizeMinimap();
 }
@@ -1980,6 +2165,13 @@ Promise.all([
     outFrameH = outParsed.frameH;
     clearMarkerRow(outSprite);
   }
+
+  enemyWalkData    = canvasToPixelData(enemyWalkSprite);
+  enemyFireData    = canvasToPixelData(enemyFireSprite);
+  enemyDamagedData = canvasToPixelData(enemyDamagedSprite);
+  enemyDyingData   = canvasToPixelData(enemyDyingSprite);
+  doorData         = canvasToPixelData(doorSprite);
+
   weaponFrame = spriteFrameFor(weaponSprite);
   if (!weaponFrameH) weaponFrameH = weaponFrame.frameH;
   if (!enemyWalkFrames) {
@@ -2008,6 +2200,7 @@ Promise.all([
     doorFrameH = fallback.frameH;
   }
   setupPointerLock();
-  resetGame();
+  hudEl.style.display = "none";
+  showMenu();
   requestAnimationFrame(frame);
 });
